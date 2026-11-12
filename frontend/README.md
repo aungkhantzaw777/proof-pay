@@ -2,6 +2,11 @@
 
 The frontend is built with [Vite](https://vitejs.dev/), [React](https://react.dev/), [TypeScript](https://www.typescriptlang.org/), [TanStack Query](https://tanstack.com/query), [TanStack Router](https://tanstack.com/router), [Tailwind CSS](https://tailwindcss.com/), and [shadcn/ui](https://ui.shadcn.com/).
 
+
+## Business Flow
+
+[Watch the business flow overview →](https://youtu.be/iUlqyHK3nL8)
+
 ## Requirements
 
 - [Bun](https://bun.sh/)

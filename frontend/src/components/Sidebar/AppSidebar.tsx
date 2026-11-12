@@ -25,7 +25,7 @@ const baseItems: Item[] = [
   { icon: Link2, title: "Payment Links", path: "/dashboard/payment-links" },
   { icon: List, title: "Transactions", path: "/dashboard/transactions" },
   { icon: Receipt, title: "Receipts", path: "/dashboard/receipts" },
-  { icon: Briefcase, title: "Items", path: "/items" },
+  // { icon: Briefcase, title: "Items", path: "/items" },
   { icon: Settings, title: "Settings", path: "/settings" },
 ]
 
