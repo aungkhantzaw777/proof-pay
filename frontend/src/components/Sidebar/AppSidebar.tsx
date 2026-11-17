@@ -1,5 +1,4 @@
 import {
-  Briefcase,
   LayoutDashboard,
   Link2,
   List,

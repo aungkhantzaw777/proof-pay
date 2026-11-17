@@ -10,3 +10,4 @@ backend/app/frontend/
 .env.*
 .env.bak
 .production.env
+walkthrough.md
