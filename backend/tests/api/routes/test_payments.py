@@ -527,7 +527,7 @@ def test_chipnet_network_is_not_testnet(monkeypatch):
     assert PREFIXES["chipnet"] == "bchtest"
 
 
-def test_nownodes_scan_adapter_and_rpc_not_found(monkeypatch):
+def test_nownodes_history_adapter_and_rpc_not_found(monkeypatch):
     import httpx
 
     from app.payments.chain import TransactionNotFound
@@ -537,41 +537,41 @@ def test_nownodes_scan_adapter_and_rpc_not_found(monkeypatch):
 
     def rpc(method, params=None):
         calls.append((method, params))
+        if method == "getblockchaininfo":
+            return {"chain": "main", "initialblockdownload": False}
+        assert method == "getrawtransaction"
         return {
-            "getblockchaininfo": {"chain": "main", "initialblockdownload": False},
-            "getblockcount": 100,
-            "scantxoutset": {
-                "success": True,
-                "unspents": [
-                    {
-                        "txid": TX1,
-                        "vout": 0,
-                        "amount": Decimal("0.00000001"),
-                        "height": 100,
-                    },
-                    {
-                        "txid": TX1,
-                        "vout": 1,
-                        "amount": Decimal("0.29999999"),
-                        "height": 100,
-                    },
-                    {"txid": TX2, "vout": 0, "amount": Decimal("0.7"), "height": 99},
-                ],
-            },
-        }[method]
+            "txid": params[0],
+            "confirmations": 0 if params[0] == TX1 else 2,
+            "vout": [
+                {
+                    "n": 0,
+                    "value": Decimal("0.00000001"),
+                    "scriptPubKey": {"hex": address_script_hex(ADDRESS, "mainnet")},
+                }
+            ],
+        }
 
     monkeypatch.setattr(provider, "_call", rpc)
+    pages = []
+
+    def history(address, page):
+        assert address == ADDRESS
+        pages.append(page)
+        return {
+            "page": page,
+            "totalPages": 2,
+            "txids": [TX1, TX1.upper()] if page == 1 else [TX1, TX2],
+        }
+
+    monkeypatch.setattr(provider, "_address_page", history)
     provider.watch_address(ADDRESS, "mainnet")
     assert calls == [("getblockchaininfo", None)]
     assert provider.incoming(ADDRESS, "mainnet") == [TX1, TX2]
-    assert ("scantxoutset", ["start", [f"addr({ADDRESS})"]]) in calls
-    assert verify_transaction(provider, TX1, "mainnet", ADDRESS) == [
-        (0, 1, 1),
-        (1, 29999999, 1),
-    ]
-    assert verify_transaction(provider, TX2, "mainnet", ADDRESS) == [(0, 70000000, 2)]
-    provider.incoming(ADDRESS, "mainnet")
-    assert sum(method == "getblockcount" for method, _ in calls) == 1
+    assert pages == [1, 2]
+    assert verify_transaction(provider, TX1, "mainnet", ADDRESS) == [(0, 1, 0)]
+    assert verify_transaction(provider, TX2, "mainnet", ADDRESS) == [(0, 1, 2)]
+    assert sum(method == "getrawtransaction" for method, _ in calls) == 2
 
     # BCHN reports missing transactions as JSON-RPC errors with HTTP 500.
     class RpcClient:
@@ -1583,7 +1583,8 @@ def test_nownodes_headers_and_retry(monkeypatch, busy):
     assert calls[0]["id"] == "scan"
 
 
-def test_nownodes_issue_and_discover(context, monkeypatch):
+@pytest.mark.parametrize("confirmations,expected", [(0, "detected"), (1, "confirmed")])
+def test_nownodes_issue_and_discover(context, monkeypatch, confirmations, expected):
     from app.payments import worker
 
     client, headers, _ = context
@@ -1592,21 +1593,38 @@ def test_nownodes_issue_and_discover(context, monkeypatch):
     provider = BCHNodeProvider(api_key="test-key")
     calls = []
 
-    def rpc(method, _params=None):
+    def rpc(method, params=None):
         calls.append(method)
+        if method == "getblockchaininfo":
+            return {"chain": "main", "initialblockdownload": False}
+        assert method == "getrawtransaction"
+        txid = params[0]
         return {
-            "getblockchaininfo": {"chain": "main", "initialblockdownload": False},
-            "getblockcount": 100,
-            "scantxoutset": {
-                "success": True,
-                "unspents": [
-                    {"txid": TX1, "vout": 0, "amount": Decimal("0.3"), "height": 100},
-                    {"txid": TX2, "vout": 2, "amount": Decimal("0.7"), "height": 99},
-                ],
-            },
-        }[method]
+            "txid": txid,
+            "confirmations": confirmations,
+            "vout": [
+                {
+                    "n": 0,
+                    "value": Decimal("0.3" if txid == TX1 else "0.7"),
+                    "scriptPubKey": {
+                        "hex": address_script_hex(ADDRESS, "mainnet")
+                        if txid != TX3
+                        else "76a9"
+                    },
+                }
+            ],
+        }
 
     monkeypatch.setattr(provider, "_call", rpc)
+    monkeypatch.setattr(
+        provider,
+        "_address_page",
+        lambda _address, page: {
+            "page": page,
+            "totalPages": 1,
+            "txids": [TX1, TX2, TX3],
+        },
+    )
     monkeypatch.setattr(payment_routes, "BCHNodeProvider", lambda: provider)
     monkeypatch.setattr(worker, "BCHNodeProvider", lambda: provider)
     monkeypatch.setattr(worker, "engine", engine)
@@ -1621,9 +1639,9 @@ def test_nownodes_issue_and_discover(context, monkeypatch):
     checkout = client.get(
         f"/api/v1/public/payment-requests/{draft['public_token']}"
     ).json()
-    assert checkout["payment_status"] == "confirmed"
-    assert calls.count("getblockcount") == 1
-    assert "getrawtransaction" not in calls
+    assert checkout["payment_status"] == expected
+    assert calls.count("getrawtransaction") == 3
+    assert "scantxoutset" not in calls
     assert worker.discover() == (1, 0)
 
 
@@ -1655,22 +1673,123 @@ def test_nownodes_retry_exhaustion(monkeypatch, status, error):
 
 
 @pytest.mark.parametrize(
-    "scan",
+    "data",
     [
-        {"success": False, "unspents": []},
-        {"success": True, "unspents": [{"txid": "invalid"}]},
+        {"page": 1, "totalPages": "2", "txids": []},
+        {"page": 1, "totalPages": 1, "txids": ["invalid"]},
+        {"page": 2, "totalPages": 2, "txids": []},
     ],
 )
-def test_nownodes_invalid_scan(monkeypatch, scan):
+def test_nownodes_invalid_history(monkeypatch, data):
     provider = BCHNodeProvider(api_key="test-key")
-    monkeypatch.setattr(
-        provider,
-        "_call",
-        lambda method, *_: {
-            "getblockchaininfo": {"chain": "main"},
-            "getblockcount": 100,
-            "scantxoutset": scan,
-        }[method],
-    )
+    monkeypatch.setattr(provider, "check_network", lambda _: None)
+    monkeypatch.setattr(provider, "_address_page", lambda *_: data)
     with pytest.raises(ProviderError):
         provider.incoming(ADDRESS, "mainnet")
+
+
+@pytest.mark.parametrize(
+    "operation,status,payload",
+    [
+        ("rpc", 405, None),
+        ("history", 405, None),
+        (
+            "rpc",
+            200,
+            {
+                "error": {"code": -32601, "message": "SECRET server message"},
+                "result": None,
+            },
+        ),
+        ("rpc", 200, {"error": {"code": "SECRET", "message": "SECRET"}}),
+        ("history", 200, {"error": "SECRET server message"}),
+    ],
+)
+def test_nownodes_safe_error_diagnostics(
+    monkeypatch, caplog, operation, status, payload
+):
+    import httpx
+
+    client_type = httpx.Client
+
+    def handle(_request):
+        return (
+            httpx.Response(status, json=payload)
+            if payload
+            else httpx.Response(status, text="SECRET invalid body")
+        )
+
+    monkeypatch.setattr(
+        httpx,
+        "Client",
+        lambda **kwargs: client_type(transport=httpx.MockTransport(handle), **kwargs),
+    )
+    provider = BCHNodeProvider(api_key="SECRET-key")
+    with caplog.at_level("INFO"), pytest.raises(ProviderError) as error:
+        if operation == "rpc":
+            provider._call("getblockchaininfo")
+        else:
+            provider._address_page(ADDRESS, 1)
+    assert "SECRET" not in caplog.text
+    assert "SECRET" not in str(error.value)
+    assert f"http_status={status}" in caplog.text
+    assert (
+        "method=getblockchaininfo" in caplog.text
+        if operation == "rpc"
+        else "operation=address_history method=GET" in caplog.text
+    )
+
+
+def test_nownodes_history_http_retry_and_request(monkeypatch):
+    import httpx
+
+    from app.payments import chain
+
+    client_type = httpx.Client
+    calls = []
+
+    def handle(request):
+        calls.append(request)
+        assert request.method == "GET"
+        assert request.url.host == "bchbook.nownodes.io"
+        assert request.url.path == f"/api/v2/address/{ADDRESS}"
+        assert request.url.params == httpx.QueryParams(
+            {"details": "txids", "page": 2, "pageSize": 1000}
+        )
+        assert request.headers["api-key"] == "test-key"
+        if len(calls) == 1:
+            return httpx.Response(429)
+        return httpx.Response(200, json={"page": 2, "totalPages": 2, "txids": [TX1]})
+
+    monkeypatch.setattr(
+        httpx,
+        "Client",
+        lambda **kwargs: client_type(transport=httpx.MockTransport(handle), **kwargs),
+    )
+    monkeypatch.setattr(chain.time, "sleep", lambda _: None)
+    assert BCHNodeProvider(api_key="test-key")._address_page(ADDRESS, 2)["txids"] == [
+        TX1
+    ]
+    assert len(calls) == 2
+
+
+def test_nownodes_history_empty_and_dropped_transaction(monkeypatch):
+    from app.payments.chain import TransactionNotFound
+
+    provider = BCHNodeProvider(api_key="test-key")
+    monkeypatch.setattr(provider, "check_network", lambda _: None)
+    monkeypatch.setattr(
+        provider, "_address_page", lambda *_: {"page": 1, "totalPages": 0}
+    )
+    assert provider.incoming(ADDRESS, "mainnet") == []
+    monkeypatch.setattr(
+        provider,
+        "_address_page",
+        lambda *_: {"page": 1, "totalPages": 1, "txids": [TX1]},
+    )
+
+    def missing(*_):
+        raise TransactionNotFound()
+
+    monkeypatch.setattr(provider, "transaction", missing)
+    assert provider.incoming(ADDRESS, "mainnet") == []

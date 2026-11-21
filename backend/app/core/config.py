@@ -68,6 +68,7 @@ class Settings(BaseSettings):
     BCH_NETWORK: Literal["mainnet", "testnet", "chipnet", "regtest"] = "mainnet"
     BCH_PROVIDER: Literal["nownodes_rpc"] = "nownodes_rpc"
     NOWNODES_BCH_RPC_URL: str = "https://bch.nownodes.io"
+    NOWNODES_BCH_BLOCKBOOK_URL: str = "https://bchbook.nownodes.io"
     BCH_API: str = ""
     BCH_REQUIRED_CONFIRMATIONS: int = Field(default=1, ge=1, le=100)
     BCH_RECONCILIATION_INTERVAL_SECONDS: int = Field(default=60, ge=15, le=86400)

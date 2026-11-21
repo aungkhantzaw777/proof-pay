@@ -179,11 +179,31 @@ class TransactionNotFound(ProviderError):
 class BCHNodeProvider:
     """Stateless NOWNodes adapter; create a fresh instance per scan cycle."""
 
-    def __init__(self, url: str | None = None, api_key: str | None = None):
+    def __init__(
+        self,
+        url: str | None = None,
+        api_key: str | None = None,
+        blockbook_url: str | None = None,
+    ):
         self.url = url or settings.NOWNODES_BCH_RPC_URL
         self.api_key = api_key if api_key is not None else settings.BCH_API
-        self._tip: int | None = None
-        self._scanned_transactions: dict[str, dict[str, Any]] = {}
+        self.blockbook_url = (
+            blockbook_url or settings.NOWNODES_BCH_BLOCKBOOK_URL
+        ).rstrip("/")
+        self._transactions: dict[tuple[str, str], dict[str, Any]] = {}
+
+    @staticmethod
+    def _diagnose(operation: str, method: str, status: int, code: Any = None) -> None:
+        # Only numeric RPC codes are safe; never echo upstream messages/bodies.
+        code = code if type(code) is int else None
+        logger.log(
+            logging.WARNING if status >= 400 or code is not None else logging.INFO,
+            "BCH provider operation=%s method=%s http_status=%s error_code=%s",
+            operation,
+            method,
+            status,
+            code,
+        )
 
     def _call(self, method: str, params: list[Any] | None = None) -> Any:
         if not self.api_key:
@@ -208,6 +228,7 @@ class BCHNodeProvider:
                             "params": params or [],
                         },
                     )
+                    self._diagnose("rpc", method, response.status_code)
                     if response.status_code == 429:
                         logger.warning(
                             "BCH RPC rate limited",
@@ -223,10 +244,11 @@ class BCHNodeProvider:
                     if not isinstance(data, dict):
                         raise ValueError("Invalid RPC response")
                     error = data.get("error")
-                    if error:
+                    if error is not None:
                         if not isinstance(error, dict):
                             raise ValueError("Invalid RPC error")
                         code = error.get("code")
+                        self._diagnose("rpc", method, response.status_code, code)
                         if method == "scantxoutset" and code == -8:
                             logger.warning(
                                 "BCH scan busy",
@@ -242,9 +264,15 @@ class BCHNodeProvider:
                             )
                         logger.warning(
                             "BCH RPC failed",
-                            extra={"rpc_method": method, "rpc_code": code},
+                            extra={
+                                "rpc_method": method,
+                                "rpc_code": code if type(code) is int else None,
+                            },
                         )
-                        raise ProviderError(f"BCH RPC {method} failed (code {code})")
+                        safe_code = code if type(code) is int else None
+                        raise ProviderError(
+                            f"BCH RPC {method} failed (code {safe_code})"
+                        )
                     response.raise_for_status()
                     if "result" not in data:
                         raise ValueError("Missing RPC result")
@@ -276,59 +304,95 @@ class BCHNodeProvider:
         normalize_address(address, network)
         self.check_network(network)
 
+    def _address_page(self, address: str, page: int) -> dict[str, Any]:
+        if not self.api_key:
+            raise ProviderError("BCH_API is not configured")
+        for attempt in range(3):
+            try:
+                with httpx.Client(timeout=httpx.Timeout(30, connect=5)) as client:
+                    response = client.get(
+                        f"{self.blockbook_url}/api/v2/address/{address}",
+                        headers={"api-key": self.api_key},
+                        params={"details": "txids", "page": page, "pageSize": 1000},
+                    )
+                self._diagnose("address_history", "GET", response.status_code)
+                if response.status_code == 429:
+                    if attempt < 2:
+                        time.sleep(0.5 * 2**attempt)
+                        continue
+                    raise ProviderError(
+                        "BCH address history rate limited; retry next cycle"
+                    )
+                response.raise_for_status()
+                data = response.json()
+                if not isinstance(data, dict) or data.get("error") is not None:
+                    raise ValueError("Invalid address history response")
+                return data
+            except (httpx.HTTPError, ValueError) as exc:
+                # Do not propagate URLs, provider messages, or response bodies.
+                logger.warning(
+                    "BCH provider operation=address_history method=GET failed type=%s",
+                    type(exc).__name__,
+                )
+                raise ProviderError(
+                    "BCH address history unavailable or invalid"
+                ) from exc
+        raise ProviderError("BCH address history unavailable")
+
     def incoming(self, address: str, network: str) -> list[str]:
         address = normalize_address(address, network)
         self.check_network(network)
-        result = self._call("scantxoutset", ["start", [f"addr({address})"]])
-        if (
-            not isinstance(result, dict)
-            or result.get("success") is not True
-            or not isinstance(result.get("unspents"), list)
-        ):
-            raise ProviderError("BCH UTXO scan did not complete")
-        if self._tip is None:
-            tip = self._call("getblockcount")
-            if type(tip) is not int or tip < 0:
-                raise ProviderError("Invalid BCH tip height")
-            self._tip = tip
-        transactions: dict[str, dict[str, Any]] = {}
-        seen = set()
-        try:
-            for row in result["unspents"]:
-                txid, vout, height = row["txid"], row["vout"], row["height"]
-                if (
-                    not isinstance(txid, str)
-                    or not re.fullmatch(r"[0-9a-fA-F]{64}", txid)
-                    or type(vout) is not int
-                    or vout < 0
-                    or type(height) is not int
-                    or height <= 0
-                    or (txid.lower(), vout) in seen
+        self._transactions.clear()
+        txids: set[str] = set()
+        page = 1
+        while True:
+            data = self._address_page(address, page)
+            pages, current, rows = (
+                data.get("totalPages"),
+                data.get("page"),
+                data.get("txids", []),
+            )
+            if (
+                type(pages) is not int
+                or pages < 0
+                or type(current) is not int
+                or current != page
+                or not isinstance(rows, list)
+                or (pages == 0 and rows)
+            ):
+                raise ProviderError("Invalid BCH address history pagination")
+            for txid in rows:
+                if not isinstance(txid, str) or not re.fullmatch(
+                    r"[0-9a-fA-F]{64}", txid
                 ):
-                    raise ValueError("Invalid UTXO")
-                txid = txid.lower()
-                seen.add((txid, vout))
-                confirmations = max(0, self._tip - height + 1)
-                amount = bch_to_sats(row["amount"])
-                tx = transactions.setdefault(
-                    txid, {"txid": txid, "confirmations": confirmations, "vout": []}
-                )
-                tx["confirmations"] = min(tx["confirmations"], confirmations)
-                tx["vout"].append(
-                    {
-                        "n": vout,
-                        "value": Decimal(amount) / 100_000_000,
-                        "scriptPubKey": {"hex": address_script_hex(address, network)},
-                    }
-                )
-        except (KeyError, TypeError, ValueError) as exc:
-            raise ProviderError("Invalid BCH UTXO data") from exc
-        self._scanned_transactions = transactions
-        return sorted(transactions)
+                    raise ProviderError("Invalid BCH address history transaction")
+                txids.add(txid.lower())
+            if page >= pages:
+                break
+            page += 1
+        # The index includes spent receipts, mempool transactions and outgoing
+        # transactions. Only node-verified matching outputs are candidates.
+        script = address_script_hex(address, network)
+        incoming = []
+        for txid in sorted(txids):
+            try:
+                tx = self.transaction(txid, network)
+            except TransactionNotFound:
+                # Index lag / dropped mempool transaction: no payment evidence.
+                continue
+            try:
+                if any(
+                    output["scriptPubKey"]["hex"].lower() == script
+                    for output in tx["vout"]
+                ):
+                    incoming.append(txid)
+            except (KeyError, TypeError, AttributeError) as exc:
+                raise ProviderError("Invalid BCH transaction output") from exc
+        return incoming
 
     def transaction(self, txid: str, network: str) -> dict[str, Any]:
-        if txid in self._scanned_transactions:
-            return self._scanned_transactions[txid]
+        if (network, txid) in self._transactions:
+            return self._transactions[network, txid]
         self.check_network(network)
         tx = self._call("getrawtransaction", [txid, 1])
         if not isinstance(tx, dict):
@@ -337,4 +401,5 @@ class BCHNodeProvider:
             tx.get("vout"), list
         ):
             raise ProviderError("BCH provider returned a different transaction")
+        self._transactions[network, txid] = tx
         return tx
