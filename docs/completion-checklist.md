@@ -10,7 +10,7 @@ by [reusable BCH addresses](reusable-bch-addresses.md).
 - [x] Permanent atomic destination reservations; reuse rejected across merchants, aliases, deletion, cancellation and expiry.
 - [x] Fresh merchant-provided addresses watched before publication; automatic incoming discovery independently verifies outputs.
 - [x] Durable separate Compose worker with PostgreSQL singleton lock, retry/backoff, fair persisted scan attempts, restart recovery, known-output rechecks and reorg correction.
-- [x] BCHN adapter validates network/watch-only wallet health; missing watches fail visibly. Chipnet supported explicitly.
+- [x] NOWNodes adapter validates network/readiness and discovers UTXOs without node wallets.
 - [x] Integer satoshi accounting, frozen issued terms, partial funding/remaining amount URI, detected versus confirmed funding, late/overpayment reporting.
 - [x] Checkout/status polling and merchant dashboard/detail/list polling.
 - [x] Receipt requested/issued amounts, destination, current confirmations/evidence, network explorer links and verification timestamp; internal IDs excluded publicly.
@@ -25,7 +25,7 @@ by [reusable BCH addresses](reusable-bch-addresses.md).
 - [x] Frontend TypeScript/production build, targeted Biome, backend Ruff and targeted Python type checks.
 - [x] Compose configuration validation; Alembic monitoring migration generates PostgreSQL SQL offline.
 - [ ] PostgreSQL migration execution, advisory-lock multi-process verification and full auth/backend suite: Docker daemon is stopped; no isolated PostgreSQL service is available.
-- [ ] Real BCHN incoming-payment/reorg demonstration: `BCH_RPC_URL` is unset in the current environment. No live chain verification claimed.
+- [ ] Live NOWNodes incoming-payment/reorg demonstration remains a deployment check; mocked tests do not establish live endpoint capabilities.
 
 ## Core work still unfinished
 - [ ] WizardConnect customer transaction construction/signing/broadcast with verified network handling and external-wallet approval. Existing integration connects/restores/disconnects only; standard BCH payment URI/QR works independently.

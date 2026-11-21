@@ -527,32 +527,51 @@ def test_chipnet_network_is_not_testnet(monkeypatch):
     assert PREFIXES["chipnet"] == "bchtest"
 
 
-def test_node_watch_only_adapter_and_rpc_not_found(monkeypatch):
+def test_nownodes_scan_adapter_and_rpc_not_found(monkeypatch):
     import httpx
 
     from app.payments.chain import TransactionNotFound
 
-    provider = BCHNodeProvider(url="http://unused")
+    provider = BCHNodeProvider(url="http://unused", api_key="test-key")
     calls = []
 
     def rpc(method, params=None):
         calls.append((method, params))
         return {
             "getblockchaininfo": {"chain": "main", "initialblockdownload": False},
-            "getwalletinfo": {"private_keys_enabled": False, "scanning": False},
-            "importaddress": None,
-            "getaddressinfo": {"iswatchonly": True},
-            "listreceivedbyaddress": [{"txids": [TX1, TX1, TX2]}],
+            "getblockcount": 100,
+            "scantxoutset": {
+                "success": True,
+                "unspents": [
+                    {
+                        "txid": TX1,
+                        "vout": 0,
+                        "amount": Decimal("0.00000001"),
+                        "height": 100,
+                    },
+                    {
+                        "txid": TX1,
+                        "vout": 1,
+                        "amount": Decimal("0.29999999"),
+                        "height": 100,
+                    },
+                    {"txid": TX2, "vout": 0, "amount": Decimal("0.7"), "height": 99},
+                ],
+            },
         }[method]
 
     monkeypatch.setattr(provider, "_call", rpc)
     provider.watch_address(ADDRESS, "mainnet")
-    assert ("importaddress", [ADDRESS, "proofpay", False]) in calls
+    assert calls == [("getblockchaininfo", None)]
     assert provider.incoming(ADDRESS, "mainnet") == [TX1, TX2]
-    assert calls[-1] == ("listreceivedbyaddress", [0, False, True, ADDRESS])
-    monkeypatch.setattr(provider, "_call", lambda *args: {"private_keys_enabled": True})
-    with pytest.raises(ProviderError, match="watch-only"):
-        provider.check_watch_wallet()
+    assert ("scantxoutset", ["start", [f"addr({ADDRESS})"]]) in calls
+    assert verify_transaction(provider, TX1, "mainnet", ADDRESS) == [
+        (0, 1, 1),
+        (1, 29999999, 1),
+    ]
+    assert verify_transaction(provider, TX2, "mainnet", ADDRESS) == [(0, 70000000, 2)]
+    provider.incoming(ADDRESS, "mainnet")
+    assert sum(method == "getblockcount" for method, _ in calls) == 1
 
     # BCHN reports missing transactions as JSON-RPC errors with HTTP 500.
     class RpcClient:
@@ -573,7 +592,9 @@ def test_node_watch_only_adapter_and_rpc_not_found(monkeypatch):
 
     monkeypatch.setattr(httpx, "Client", RpcClient)
     with pytest.raises(TransactionNotFound):
-        BCHNodeProvider(url="http://unused")._call("getrawtransaction", [TX1, 1])
+        BCHNodeProvider(url="http://unused", api_key="test-key")._call(
+            "getrawtransaction", [TX1, 1]
+        )
 
 
 def test_token_aware_alias_cannot_reuse_destination(context):
@@ -1507,3 +1528,149 @@ def test_exclusivity_migration_defaults_historical_single_request_to_manual(
     fake.set(TX1, ["1"], 3)
     assert worker.discover() == (1, 0)
     assert client.get(path, headers=headers[0]).json()["received_amount_sats"] == 0
+
+
+def test_legacy_mainnet_normalization():
+    assert normalize_address("1BpEi6DfDAUFd7GtittLSdBeYJvcoaVggu", "mainnet") == ADDRESS
+    assert normalize_address(
+        "3CWFddi6m4ndiGyKqzYvsFYagqDLPVMTzC", "mainnet"
+    ).startswith("bitcoincash:p")
+    with pytest.raises(ValueError):
+        normalize_address("1BpEi6DfDAUFd7GtittLSdBeYJvcoaVggv", "mainnet")
+    with pytest.raises(ValueError):
+        normalize_address("1BpEi6DfDAUFd7GtittLSdBeYJvcoaVggu", "chipnet")
+
+
+@pytest.mark.parametrize("busy", [False, True])
+def test_nownodes_headers_and_retry(monkeypatch, busy):
+    import httpx
+
+    from app.payments import chain
+
+    calls = []
+    sleeps = []
+
+    def handle(request):
+        import json
+
+        calls.append(json.loads(request.content))
+        assert request.headers["api-key"] == "test-key"
+        assert request.headers["Content-Type"] == "application/json"
+        assert str(request.url) == "https://bch.nownodes.io"
+        if len(calls) < 3:
+            if busy:
+                return httpx.Response(
+                    500,
+                    json={"error": {"code": -8, "message": "Scan already in progress"}},
+                )
+            return httpx.Response(429, text="rate limited")
+        return httpx.Response(
+            200, json={"result": {"success": True, "unspents": []}, "error": None}
+        )
+
+    client_type = httpx.Client
+    monkeypatch.setattr(
+        httpx,
+        "Client",
+        lambda **kwargs: client_type(transport=httpx.MockTransport(handle), **kwargs),
+    )
+    monkeypatch.setattr(chain.time, "sleep", sleeps.append)
+    result = BCHNodeProvider(api_key="test-key")._call(
+        "scantxoutset", ["start", [f"addr({ADDRESS})"]]
+    )
+    assert result["success"]
+    assert len(calls) == 3 and sleeps == [0.5, 1.0]
+    assert calls[0]["id"] == "scan"
+
+
+def test_nownodes_issue_and_discover(context, monkeypatch):
+    from app.payments import worker
+
+    client, headers, _ = context
+    with next(app.dependency_overrides[get_db]()) as session:
+        engine = session.bind
+    provider = BCHNodeProvider(api_key="test-key")
+    calls = []
+
+    def rpc(method, _params=None):
+        calls.append(method)
+        return {
+            "getblockchaininfo": {"chain": "main", "initialblockdownload": False},
+            "getblockcount": 100,
+            "scantxoutset": {
+                "success": True,
+                "unspents": [
+                    {"txid": TX1, "vout": 0, "amount": Decimal("0.3"), "height": 100},
+                    {"txid": TX2, "vout": 2, "amount": Decimal("0.7"), "height": 99},
+                ],
+            },
+        }[method]
+
+    monkeypatch.setattr(provider, "_call", rpc)
+    monkeypatch.setattr(payment_routes, "BCHNodeProvider", lambda: provider)
+    monkeypatch.setattr(worker, "BCHNodeProvider", lambda: provider)
+    monkeypatch.setattr(worker, "engine", engine)
+    draft = create_invoice(client, headers[0]).json()
+    assert (
+        client.post(
+            f"/api/v1/payment-requests/{draft['id']}/issue", headers=headers[0]
+        ).status_code
+        == 200
+    )
+    assert worker.discover() == (1, 0)
+    checkout = client.get(
+        f"/api/v1/public/payment-requests/{draft['public_token']}"
+    ).json()
+    assert checkout["payment_status"] == "confirmed"
+    assert calls.count("getblockcount") == 1
+    assert "getrawtransaction" not in calls
+    assert worker.discover() == (1, 0)
+
+
+@pytest.mark.parametrize(
+    "status,error",
+    [(429, None), (500, {"code": -8, "message": "Scan already in progress"})],
+)
+def test_nownodes_retry_exhaustion(monkeypatch, status, error):
+    import httpx
+
+    from app.payments import chain
+
+    attempts = []
+
+    def handle(request):
+        attempts.append(request)
+        return httpx.Response(status, json={"error": error})
+
+    client_type = httpx.Client
+    monkeypatch.setattr(
+        httpx,
+        "Client",
+        lambda **kwargs: client_type(transport=httpx.MockTransport(handle), **kwargs),
+    )
+    monkeypatch.setattr(chain.time, "sleep", lambda _: None)
+    with pytest.raises(ProviderError, match="retry next cycle"):
+        BCHNodeProvider(api_key="test-key")._call("scantxoutset", ["start", []])
+    assert len(attempts) == 3
+
+
+@pytest.mark.parametrize(
+    "scan",
+    [
+        {"success": False, "unspents": []},
+        {"success": True, "unspents": [{"txid": "invalid"}]},
+    ],
+)
+def test_nownodes_invalid_scan(monkeypatch, scan):
+    provider = BCHNodeProvider(api_key="test-key")
+    monkeypatch.setattr(
+        provider,
+        "_call",
+        lambda method, *_: {
+            "getblockchaininfo": {"chain": "main"},
+            "getblockcount": 100,
+            "scantxoutset": scan,
+        }[method],
+    )
+    with pytest.raises(ProviderError):
+        provider.incoming(ADDRESS, "mainnet")

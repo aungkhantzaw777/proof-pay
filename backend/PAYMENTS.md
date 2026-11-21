@@ -70,44 +70,54 @@ snapshot. A receipt verifies blockchain payment to the recorded destination; it
 proves neither goods delivery nor payer identity. Public responses exclude internal
 payment/invoice IDs, contact details, xpubs and session data.
 
-## BCH Node setup
+## NOWNodes BCH setup
 
-Use a trusted, synchronized **Bitcoin Cash Node** with `txindex=1`, a persistent data
-directory, and a dedicated **watch-only wallet with private keys disabled**. RPC must
-be reachable from both backend and worker; do not expose it to the public internet.
-Create the empty wallet with `bitcoin-cli createwallet proofpay-watch true true`.
-Load it on node startup and point `BCH_RPC_URL` at its wallet-specific RPC URL,
-for example `http://bchn:48332/wallet/proofpay-watch` for Chipnet. Configure RPC
-authentication using `BCH_RPC_USER` and `BCH_RPC_PASSWORD`.
+Set `BCH_PROVIDER=nownodes_rpc` (the default),
+`NOWNODES_BCH_RPC_URL=https://bch.nownodes.io` (also the default), and `BCH_API`
+in the root `.env`. Every JSON-RPC POST sends the key in the `api-key` header.
+No wallet creation, imports, rescan, or local node is needed. Issuance validates
+the address and checks `getblockchaininfo` network/sync state.
 
-The adapter checks `getblockchaininfo` network/sync state and watch-wallet health.
-Before publishing checkout, `importaddress(address, "proofpay", false)` installs a
-watch. Reusing an already watched destination avoids repeated imports. To discover
-payments predating the initial watch, rescan the watch wallet or review a transaction
-ID directly (with `txindex=1`).
-`listreceivedbyaddress(0, false, true, address)` discovers candidate txids including
-unconfirmed receipts. Its balances are **never used for credit**. Every candidate is
-fetched through `getrawtransaction(txid, 1)` and outputs independently verified.
-Missing watched addresses fail visibly rather than silently reporting an empty history.
+Keep `BCH_NETWORK=mainnet`, `BCH_REQUIRED_CONFIRMATIONS=1`, and
+`BCH_RECONCILIATION_INTERVAL_SECONDS=60`. Mainnet legacy P2PKH/P2SH addresses
+are checksum validated and normalized to CashAddr before storage/scanning.
 
-| Environment | Meaning |
-| --- | --- |
-| `BCH_NETWORK` | `mainnet`, `testnet` (testnet3), `chipnet`, or `regtest` |
-| `BCH_RPC_URL` | Wallet-specific BCHN RPC URL; blank fails closed on issuing/claims |
-| `BCH_RPC_USER`, `BCH_RPC_PASSWORD` | RPC Basic authentication |
-| `BCH_REQUIRED_CONFIRMATIONS` | Default new-merchant threshold, minimum 1 |
-| `BCH_RECONCILIATION_INTERVAL_SECONDS` | Poll interval, default 60 |
-| `PUBLIC_CHECKOUT_BASE_URL` | External application origin for checkout/receipt URLs |
+Discovery uses `scantxoutset("start", ["addr(<CashAddr>)"])`. Each discovery
+cycle caches `getblockcount` once; confirmations are `max(0, tip - height + 1)`.
+Amounts are parsed as Decimal and stored/summed as integer satoshis. Existing
+per-output allocation and reused-address attribution safeguards still apply.
+Explicit transaction claims and rechecks of previously allocated outputs use
+stateless `getrawtransaction(txid, 1)`; the provider must serve historical
+transactions for those operations.
 
-Chipnet shares the `bchtest:` CashAddr prefix with testnet but has distinct node chain
-ID `chip`; the backend checks it explicitly. Regtest has no public explorer link.
-Network-aware explorer routes follow [BlockExplorer.cash's route documentation](https://blockexplorer.cash/llms.txt).
+UTXO scanning discovers mined, currently unspent outputs only: it does not detect
+mempool payments or payments spent before the first successful scan. It also cannot
+distinguish a historical balance from a new payment. Use a fresh destination for
+each request for automatic attribution. Reused destinations require explicit
+merchant allocation, as before. Provider failures preserve recorded evidence.
 
-Provider references: [importaddress](https://docs.bitcoincashnode.org/doc/json-rpc/importaddress/),
-[listreceivedbyaddress](https://docs.bitcoincashnode.org/doc/json-rpc/listreceivedbyaddress/),
-[getrawtransaction](https://docs.bitcoincashnode.org/doc/json-rpc/getrawtransaction/),
-[createwallet](https://docs.bitcoincashnode.org/doc/json-rpc/createwallet/),
-[network IDs](https://github.com/bitcoin-cash-node/bitcoin-cash-node/blob/master/src/chainparamsbase.cpp).
+HTTP 429 and scan-busy RPC -8 errors retry twice with bounded exponential backoff,
+then defer to the next worker cycle. Incomplete/malformed scans fail closed.
+Scans have a 120-second read timeout; other calls use 10 seconds, with a 5-second
+connection timeout. Logs include method/code/attempt fields without API keys.
+
+References: [NOWNodes BCH](https://docs.nownodes.io/bch/),
+[BCHN scantxoutset](https://docs.bitcoincashnode.org/doc/json-rpc/scantxoutset/).
+
+Restart both services after configuration/code changes:
+
+```bash
+docker compose up -d --build --force-recreate backend payment-worker
+docker compose logs --tail=100 backend payment-worker
+```
+
+For local development, stop existing processes and run these in separate terminals
+from the repository root:
+
+```bash
+cd backend && ../.venv/bin/fastapi dev app/main.py
+cd backend && ../.venv/bin/python -m app.payments.worker
+```
 
 ## Deployment, recovery and migration
 
@@ -121,7 +131,7 @@ items move to the back of the queue without refreshing verification timestamps.
 Allocated-output checks run at the configured interval independently of address
 discovery. Discovery runs in one separate thread under the same process advisory
 lock, so a slow scan or failed destination cannot impose a global backoff on known
-payment evidence. Each provider HTTP request has an eight-second timeout.
+payment evidence. Provider HTTP timeouts and bounded retries are described above.
 Logs contain request IDs and counters, not wallet sessions, addresses or RPC secrets.
 
 A restart resumes from database state and the node's persistent watch wallet,

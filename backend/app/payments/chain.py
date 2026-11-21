@@ -1,11 +1,17 @@
 """CashAddr validation and read-only Bitcoin Cash Node RPC."""
 
+import hashlib
+import logging
+import re
+import time
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
 import httpx
 
 from app.core.config import settings
+
+logger = logging.getLogger(__name__)
 
 ALPHABET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
 PREFIXES = {
@@ -31,6 +37,38 @@ def _polymod(values: list[int]) -> int:
 
 def normalize_address(value: str, network: str) -> str:
     prefix = PREFIXES[network]
+    if value.startswith(("1", "3")):
+        alphabet = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+        try:
+            number = 0
+            for char in value:
+                number = number * 58 + alphabet.index(char)
+            raw = b"\x00" * (len(value) - len(value.lstrip("1"))) + number.to_bytes(
+                (number.bit_length() + 7) // 8, "big"
+            )
+        except ValueError as exc:
+            raise ValueError("Invalid legacy BCH address") from exc
+        if (
+            network != "mainnet"
+            or len(raw) != 25
+            or raw[0] not in (0, 5)
+            or hashlib.sha256(hashlib.sha256(raw[:-4]).digest()).digest()[:4]
+            != raw[-4:]
+        ):
+            raise ValueError("Invalid legacy BCH checksum or network")
+        acc = bits = 0
+        digits = []
+        for byte in bytes([0 if raw[0] == 0 else 8]) + raw[1:21]:
+            acc = (acc << 8) | byte
+            bits += 8
+            while bits >= 5:
+                bits -= 5
+                digits.append((acc >> bits) & 31)
+        if bits:
+            digits.append((acc << (5 - bits)) & 31)
+        checksum = _polymod([ord(c) & 31 for c in prefix] + [0] + digits + [0] * 8)
+        digits.extend((checksum >> (5 * (7 - i))) & 31 for i in range(8))
+        value = f"{prefix}:{''.join(ALPHABET[digit] for digit in digits)}"
     if value.lower() != value and value.upper() != value:
         raise ValueError("Mixed case CashAddr is invalid")
     value = value.lower()
@@ -139,55 +177,83 @@ class TransactionNotFound(ProviderError):
 
 
 class BCHNodeProvider:
-    """Read-only JSON-RPC adapter. Requires txindex for old arbitrary claims."""
+    """Stateless NOWNodes adapter; create a fresh instance per scan cycle."""
 
-    def __init__(
-        self,
-        url: str | None = None,
-        user: str | None = None,
-        password: str | None = None,
-    ):
-        self.url = url or settings.BCH_RPC_URL
-        self.user = user if user is not None else settings.BCH_RPC_USER
-        self.password = password if password is not None else settings.BCH_RPC_PASSWORD
+    def __init__(self, url: str | None = None, api_key: str | None = None):
+        self.url = url or settings.NOWNODES_BCH_RPC_URL
+        self.api_key = api_key if api_key is not None else settings.BCH_API
+        self._tip: int | None = None
+        self._scanned_transactions: dict[str, dict[str, Any]] = {}
 
     def _call(self, method: str, params: list[Any] | None = None) -> Any:
-        if not self.url:
-            raise ProviderError("BCH RPC is not configured")
-        auth = (self.user, self.password or "") if self.user else None
-        try:
-            with httpx.Client(timeout=8, auth=auth) as client:
-                response = client.post(
-                    self.url,
-                    json={
-                        "jsonrpc": "1.0",
-                        "id": "proofpay",
-                        "method": method,
-                        "params": params or [],
-                    },
-                )
-                # JSON-RPC returns errors (including not-found) with HTTP 500.
-                data = response.json(parse_float=Decimal)
-                if not isinstance(data, dict):
-                    raise ValueError("Invalid RPC response")
-                if not data.get("error"):
+        if not self.api_key:
+            raise ProviderError("BCH_API is not configured")
+        for attempt in range(3):
+            try:
+                with httpx.Client(
+                    timeout=httpx.Timeout(
+                        120 if method == "scantxoutset" else 10, connect=5
+                    )
+                ) as client:
+                    response = client.post(
+                        self.url,
+                        headers={
+                            "api-key": self.api_key,
+                            "Content-Type": "application/json",
+                        },
+                        json={
+                            "jsonrpc": "1.0",
+                            "id": "scan" if method == "scantxoutset" else "proofpay",
+                            "method": method,
+                            "params": params or [],
+                        },
+                    )
+                    if response.status_code == 429:
+                        logger.warning(
+                            "BCH RPC rate limited",
+                            extra={"rpc_method": method, "attempt": attempt + 1},
+                        )
+                        if attempt < 2:
+                            time.sleep(0.5 * 2**attempt)
+                            continue
+                        raise ProviderError(
+                            "BCH provider rate limited; retry next cycle"
+                        )
+                    data = response.json(parse_float=Decimal)
+                    if not isinstance(data, dict):
+                        raise ValueError("Invalid RPC response")
+                    error = data.get("error")
+                    if error:
+                        if not isinstance(error, dict):
+                            raise ValueError("Invalid RPC error")
+                        code = error.get("code")
+                        if method == "scantxoutset" and code == -8:
+                            logger.warning(
+                                "BCH scan busy",
+                                extra={"rpc_method": method, "attempt": attempt + 1},
+                            )
+                            if attempt < 2:
+                                time.sleep(0.5 * 2**attempt)
+                                continue
+                            raise ProviderError("BCH scan busy; retry next cycle")
+                        if method == "getrawtransaction" and code == -5:
+                            raise TransactionNotFound(
+                                "Transaction not found by BCH node"
+                            )
+                        logger.warning(
+                            "BCH RPC failed",
+                            extra={"rpc_method": method, "rpc_code": code},
+                        )
+                        raise ProviderError(f"BCH RPC {method} failed (code {code})")
                     response.raise_for_status()
-        except (httpx.HTTPError, ValueError) as exc:
-            raise ProviderError(
-                "BCH provider unavailable or returned invalid data"
-            ) from exc
-        if data.get("error") is not None and not isinstance(data["error"], dict):
-            raise ProviderError("Invalid BCH RPC error")
-        if (
-            data.get("error")
-            and method == "getrawtransaction"
-            and data["error"].get("code") == -5
-        ):
-            raise TransactionNotFound("Transaction not found by BCH node")
-        if data.get("error"):
-            raise ProviderError(f"BCH RPC {method} failed")
-        result = data.get("result")
-        return result
+                    if "result" not in data:
+                        raise ValueError("Missing RPC result")
+                    return data["result"]
+            except (httpx.HTTPError, ValueError) as exc:
+                raise ProviderError(
+                    "BCH provider unavailable or returned invalid data"
+                ) from exc
+        raise ProviderError("BCH provider unavailable")
 
     def check_network(self, network: str) -> None:
         info = self._call("getblockchaininfo")
@@ -205,45 +271,64 @@ class BCHNodeProvider:
         if info.get("initialblockdownload") is True:
             raise ProviderError("BCH node is still syncing")
 
-    def check_watch_wallet(self) -> None:
-        info = self._call("getwalletinfo")
-        if not isinstance(info, dict) or info.get("private_keys_enabled") is not False:
-            raise ProviderError(
-                "Configure a dedicated BCH watch-only wallet with private keys disabled"
-            )
-        if info.get("scanning"):
-            raise ProviderError("BCH watch-only wallet is rescanning")
-
     def watch_address(self, address: str, network: str) -> None:
+        # Issuance interface only: shared nodes need no wallet or address import.
+        normalize_address(address, network)
         self.check_network(network)
-        self.check_watch_wallet()
-        # Destinations are watched before checkout is published. No keys.
-        self._call(
-            "importaddress", [normalize_address(address, network), "proofpay", False]
-        )
 
     def incoming(self, address: str, network: str) -> list[str]:
+        address = normalize_address(address, network)
         self.check_network(network)
-        self.check_watch_wallet()
-        info = self._call("getaddressinfo", [address])
-        if not isinstance(info, dict) or info.get("iswatchonly") is not True:
-            raise ProviderError(
-                "Receiving destination missing from watch-only wallet; restore wallet or import and rescan"
-            )
-        rows = self._call("listreceivedbyaddress", [0, False, True, address])
-        if not isinstance(rows, list):
-            raise ProviderError("Invalid address history")
-        txids: set[str] = set()
-        for row in rows:
-            if not isinstance(row, dict) or not isinstance(row.get("txids"), list):
-                raise ProviderError("Invalid address history entry")
-            for txid in row["txids"]:
-                if not isinstance(txid, str) or len(txid) != 64:
-                    raise ProviderError("Invalid history transaction")
-                txids.add(txid)
-        return sorted(txids)
+        result = self._call("scantxoutset", ["start", [f"addr({address})"]])
+        if (
+            not isinstance(result, dict)
+            or result.get("success") is not True
+            or not isinstance(result.get("unspents"), list)
+        ):
+            raise ProviderError("BCH UTXO scan did not complete")
+        if self._tip is None:
+            tip = self._call("getblockcount")
+            if type(tip) is not int or tip < 0:
+                raise ProviderError("Invalid BCH tip height")
+            self._tip = tip
+        transactions: dict[str, dict[str, Any]] = {}
+        seen = set()
+        try:
+            for row in result["unspents"]:
+                txid, vout, height = row["txid"], row["vout"], row["height"]
+                if (
+                    not isinstance(txid, str)
+                    or not re.fullmatch(r"[0-9a-fA-F]{64}", txid)
+                    or type(vout) is not int
+                    or vout < 0
+                    or type(height) is not int
+                    or height <= 0
+                    or (txid.lower(), vout) in seen
+                ):
+                    raise ValueError("Invalid UTXO")
+                txid = txid.lower()
+                seen.add((txid, vout))
+                confirmations = max(0, self._tip - height + 1)
+                amount = bch_to_sats(row["amount"])
+                tx = transactions.setdefault(
+                    txid, {"txid": txid, "confirmations": confirmations, "vout": []}
+                )
+                tx["confirmations"] = min(tx["confirmations"], confirmations)
+                tx["vout"].append(
+                    {
+                        "n": vout,
+                        "value": Decimal(amount) / 100_000_000,
+                        "scriptPubKey": {"hex": address_script_hex(address, network)},
+                    }
+                )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ProviderError("Invalid BCH UTXO data") from exc
+        self._scanned_transactions = transactions
+        return sorted(transactions)
 
     def transaction(self, txid: str, network: str) -> dict[str, Any]:
+        if txid in self._scanned_transactions:
+            return self._scanned_transactions[txid]
         self.check_network(network)
         tx = self._call("getrawtransaction", [txid, 1])
         if not isinstance(tx, dict):

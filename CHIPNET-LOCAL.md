@@ -1,3 +1,7 @@
+> Historical local-node setup. The active integration now defaults to NOWNodes
+> mainnet with `BCH_API`; wallet setup below is no longer used by the application.
+> See [current setup](backend/PAYMENTS.md#nownodes-bch-setup).
+
 # Local Chipnet node
 
 This setup is for the native development backend (FastAPI on the host).
