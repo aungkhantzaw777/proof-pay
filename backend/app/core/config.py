@@ -66,9 +66,9 @@ class Settings(BaseSettings):
     FIRST_SUPERUSER: EmailStr
     FIRST_SUPERUSER_PASSWORD: str
     BCH_NETWORK: Literal["mainnet", "testnet", "chipnet", "regtest"] = "mainnet"
-    BCH_RPC_URL: str | None = None
-    BCH_RPC_USER: str | None = None
-    BCH_RPC_PASSWORD: str | None = None
+    BCH_PROVIDER: Literal["nownodes_rpc"] = "nownodes_rpc"
+    NOWNODES_BCH_RPC_URL: str = "https://bch.nownodes.io"
+    BCH_API: str = ""
     BCH_REQUIRED_CONFIRMATIONS: int = Field(default=1, ge=1, le=100)
     BCH_RECONCILIATION_INTERVAL_SECONDS: int = Field(default=60, ge=15, le=86400)
     PUBLIC_CHECKOUT_BASE_URL: str | None = None

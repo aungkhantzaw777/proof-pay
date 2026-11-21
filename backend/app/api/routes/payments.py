@@ -301,7 +301,7 @@ def issue_request(
     except ProviderError as exc:
         raise HTTPException(
             503,
-            "Cannot monitor this destination. Check the BCH node watch-only wallet configuration.",
+            "BCH provider unavailable. Check NOWNodes connectivity, network and BCH_API.",
         ) from exc
     invoice.watched_at = now()
     invoice.status = "pending"

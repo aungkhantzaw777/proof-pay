@@ -15,12 +15,10 @@ merchant review, even when only one request is currently pending. Amounts, reque
 age, and pending status never select an invoice automatically. Existing verified
 allocations and receipt snapshots are preserved.
 
-The worker imports/watches destinations through the existing BCHN watch-only
-provider and scans each destination once per cycle. It stores observations in
-`detected_output`, independently of `payment_output`. Observations never enter
-invoice totals, the payments export, dashboard income, or receipts. Only an explicit
-merchant allocation or the forward-tracked exclusive policy can credit an output. Existing
-allocated outputs continue through the confirmation/reorg reconciliation worker.
+The worker scans destinations through the stateless NOWNodes BCH JSON-RPC
+`scantxoutset` method. Issuance validates addresses and chain readiness without
+importing addresses or requiring a node wallet. See [BCH setup](../backend/PAYMENTS.md#nownodes-bch-setup)
+for configuration and the limitations of UTXO discovery.
 
 On the payment-request detail screen, select a detected transaction or enter its
 ID, verify its outputs, then select and assign eligible outputs to the request.
